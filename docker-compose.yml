@@ -16,8 +16,8 @@
 services:
   mcp-server:
     build: .
-    ports:
-      - "8080:8000"
+    expose:
+      - 8000
     environment:
       # ── Odoo connection ──────────────────────────────────────────────────
       - ODOO_URL=${ODOO_URL}
@@ -37,8 +37,4 @@ services:
       - CACHE_MAX_SIZE=1000
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+      disable: true

@@ -2,7 +2,10 @@
 # Singular Agency – Odoo MCP Server
 # Centralized MCP server for Claude Cowork, deployable via Hostinger Easy Deploy
 #
-# Required environment variables (set in Hostinger dashboard or .env file):
+# Hostinger's reverse proxy handles ports 80/443 externally — we expose the
+# app on 8080 and let Hostinger route to it.
+#
+# Required environment variables (set in Hostinger dashboard):
 #   ODOO_URL          — e.g. https://mycompany.odoo.com
 #   ODOO_DB           — Odoo database name
 #   ODOO_USERNAME     — Odoo login email
@@ -13,8 +16,8 @@
 services:
   mcp-server:
     build: .
-    expose:
-      - "8000"
+    ports:
+      - "8080:8000"
     environment:
       # ── Odoo connection ──────────────────────────────────────────────────
       - ODOO_URL=${ODOO_URL}
@@ -41,14 +44,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-
-  nginx:
-    build: ./nginx
-    ports:
-      - "80:80"
-    depends_on:
-      - mcp-server
-    restart: unless-stopped
 
 volumes:
   logs:

@@ -2,22 +2,20 @@
 # Singular Agency – Odoo MCP Server
 # Centralized MCP server for Claude Cowork, deployable via Hostinger Easy Deploy
 #
-# Hostinger's reverse proxy handles ports 80/443 externally — we expose the
-# app on 8080 and let Hostinger route to it.
-#
 # Required environment variables (set in Hostinger dashboard):
 #   ODOO_URL          — e.g. https://mycompany.odoo.com
 #   ODOO_DB           — Odoo database name
 #   ODOO_USERNAME     — Odoo login email
 #   ODOO_API_KEY      — Odoo API key (User > Preferences > API Keys)
 #   MCP_API_KEY       — Secret key Claude uses to authenticate with this server
+#   TRAEFIK_HOST      — base domain managed by Traefik (set automatically by Hostinger)
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
   mcp-server:
     build: .
-    ports:
-      - "8080:8000"
+    expose:
+      - "8000"
     environment:
       # ── Odoo connection ──────────────────────────────────────────────────
       - ODOO_URL=${ODOO_URL}
@@ -29,7 +27,7 @@ services:
       - MCP_PORT=8000
       - MCP_DEBUG=false
       - MCP_LOG_LEVEL=INFO
-      # ── Auth (required for centralized/public deployment) ────────────────
+      # ── Auth ────────────────────────────────────────────────────────────
       - MCP_API_KEY=${MCP_API_KEY}
       # ── Cache ────────────────────────────────────────────────────────────
       - CACHE_ENABLED=true
@@ -42,3 +40,16 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.rule=Host(`${COMPOSE_PROJECT_NAME}.${TRAEFIK_HOST}`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=websecure
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=letsencrypt
+      - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=8000
+    networks:
+      - traefik-proxy
+      - default
+
+networks:
+  traefik-proxy:
+    external: true

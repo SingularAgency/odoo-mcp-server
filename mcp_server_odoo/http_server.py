@@ -676,12 +676,14 @@ app.add_middleware(
 async def api_key_auth(request: Request, call_next):
     """API Key authentication middleware.
 
-    Skips auth for /health endpoint.
-    Validates X-API-Key or Authorization: Bearer <key> headers
-    when MCP_API_KEY environment variable is set.
+    Skips auth for /health and root GET endpoints.
+    Accepts the API key from any of these sources (checked in order):
+      1. Query parameter  ?key=VALUE          (for Claude custom connectors UI)
+      2. Header           X-API-Key: VALUE    (for Cursor / programmatic use)
+      3. Header           Authorization: Bearer VALUE
     """
-    # Always allow health checks without auth
-    if request.url.path in ("/health", "/"):
+    # Always allow health checks and root GET without auth
+    if request.url.path in ("/health", "/") and request.method == "GET":
         return await call_next(request)
 
     mcp_api_key = os.environ.get("MCP_API_KEY", "").strip()
@@ -690,15 +692,18 @@ async def api_key_auth(request: Request, call_next):
     if not mcp_api_key:
         return await call_next(request)
 
-    # Extract token from headers
-    token = ""
-    auth_header = request.headers.get("Authorization", "")
-    x_api_key = request.headers.get("X-API-Key", "")
+    # 1. Query parameter ?key=VALUE  (used by Claude connector UI — no custom headers)
+    token = request.query_params.get("key", "")
 
-    if auth_header.startswith("Bearer "):
-        token = auth_header[len("Bearer "):]
-    elif x_api_key:
-        token = x_api_key
+    # 2. X-API-Key header
+    if not token:
+        token = request.headers.get("X-API-Key", "")
+
+    # 3. Authorization: Bearer <token>
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer "):]
 
     if token != mcp_api_key:
         return JSONResponse(
@@ -708,8 +713,11 @@ async def api_key_auth(request: Request, call_next):
                 "id": None,
                 "error": {
                     "code": -32001,
-                    "message": "Unauthorized: missing or invalid API key. "
-                               "Provide it via 'X-API-Key' or 'Authorization: Bearer <key>' header."
+                    "message": (
+                        "Unauthorized: missing or invalid API key. "
+                        "Provide it via: ?key=VALUE (URL param), "
+                        "X-API-Key header, or Authorization: Bearer <key>."
+                    )
                 }
             }
         )

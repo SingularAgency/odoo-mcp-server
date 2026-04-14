@@ -1,0 +1,59 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singular Agency – Odoo MCP Server
+# Centralized MCP server for Claude Cowork, deployable via Hostinger Easy Deploy
+#
+# Required environment variables (set in Hostinger dashboard or .env file):
+#   ODOO_URL          — e.g. https://mycompany.odoo.com
+#   ODOO_DB           — Odoo database name
+#   ODOO_USERNAME     — Odoo login email
+#   ODOO_API_KEY      — Odoo API key (User > Preferences > API Keys)
+#   MCP_API_KEY       — Secret key Claude uses to authenticate with this server
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  mcp-server:
+    build: .
+    expose:
+      - "8000"
+    environment:
+      # ── Odoo connection ──────────────────────────────────────────────────
+      - ODOO_URL=${ODOO_URL}
+      - ODOO_DB=${ODOO_DB}
+      - ODOO_USERNAME=${ODOO_USERNAME}
+      - ODOO_API_KEY=${ODOO_API_KEY}
+      # ── MCP server ──────────────────────────────────────────────────────
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - MCP_DEBUG=false
+      - MCP_LOG_LEVEL=INFO
+      # ── Auth (required for centralized/public deployment) ────────────────
+      - MCP_API_KEY=${MCP_API_KEY}
+      # ── Cache ────────────────────────────────────────────────────────────
+      - CACHE_ENABLED=true
+      - CACHE_TTL=300
+      - CACHE_MAX_SIZE=1000
+    volumes:
+      - logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  logs:

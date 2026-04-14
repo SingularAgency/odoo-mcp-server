@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -669,6 +670,51 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def api_key_auth(request: Request, call_next):
+    """API Key authentication middleware.
+
+    Skips auth for /health endpoint.
+    Validates X-API-Key or Authorization: Bearer <key> headers
+    when MCP_API_KEY environment variable is set.
+    """
+    # Always allow health checks without auth
+    if request.url.path in ("/health", "/"):
+        return await call_next(request)
+
+    mcp_api_key = os.environ.get("MCP_API_KEY", "").strip()
+
+    # If no API key configured, allow all traffic (dev/open mode)
+    if not mcp_api_key:
+        return await call_next(request)
+
+    # Extract token from headers
+    token = ""
+    auth_header = request.headers.get("Authorization", "")
+    x_api_key = request.headers.get("X-API-Key", "")
+
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer "):]
+    elif x_api_key:
+        token = x_api_key
+
+    if token != mcp_api_key:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32001,
+                    "message": "Unauthorized: missing or invalid API key. "
+                               "Provide it via 'X-API-Key' or 'Authorization: Bearer <key>' header."
+                }
+            }
+        )
+
+    return await call_next(request)
 
 
 def _stream_response(data: Dict[str, Any]):

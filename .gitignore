@@ -150,9 +150,9 @@ test_*.py
 .env.local
 .env.*.local
 
-# Docker Compose with credentials (keep example file)
-docker-compose.yml
+# docker-compose.override.yml may contain local credentials — never commit it
 docker-compose.override.yml
+# docker-compose.yml is safe to commit (uses env vars, no hardcoded secrets)
 
 # Logs
 logs/

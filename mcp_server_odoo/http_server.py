@@ -752,19 +752,25 @@ async def mcp_endpoint(request: Request):
     try:
         # Parse request body
         body = await request.json()
-        
+
         # Extract JSON-RPC fields
         method = body.get("method")
         params = body.get("params", {})
         request_id = body.get("id")
-        
+
+        # JSON-RPC notifications have no "id" — the spec says the server MUST
+        # NOT reply to them.  Returning an error for notifications breaks the
+        # MCP handshake in clients like Cursor (they send
+        # notifications/initialized after initialize and expect silence).
+        is_notification = "id" not in body
+
         # Check for streaming preference
         wants_streaming = request.headers.get("accept") == "text/event-stream"
-        
+
         # Generate session ID if not present
         session_id = request.headers.get("Mcp-Session-Id", str(uuid.uuid4()))
-        
-        logger.info(f"MCP request: {method} (streaming: {wants_streaming})")
+
+        logger.info(f"MCP request: {method} (notification: {is_notification}, streaming: {wants_streaming})")
         
         # Handle different MCP methods
         if method == "initialize":
@@ -925,21 +931,20 @@ async def mcp_endpoint(request: Request):
                 else:
                     return JSONResponse(content=response)
         
-        elif method == "notifications/cancelled":
-            # Handle notification cancellation - just acknowledge
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {}
-            }
-            
-            if wants_streaming:
-                return EventSourceResponse(_stream_response(response))
-            else:
-                return JSONResponse(content=response)
-        
+        elif method and method.startswith("notifications/"):
+            # JSON-RPC notifications must NOT receive a response per the spec.
+            # Clients like Cursor send notifications/initialized after the
+            # initialize handshake; returning an error here breaks tool discovery.
+            logger.debug(f"Received notification (no reply): {method}")
+            return Response(status_code=204)
+
         else:
-            # Log unknown methods for debugging
+            # Unknown request-style method (has an id) — return method-not-found.
+            # But if somehow it has no id (notification), stay silent.
+            if is_notification:
+                logger.debug(f"Ignoring unknown notification: {method}")
+                return Response(status_code=204)
+
             logger.warning(f"Unknown method requested: {method}")
             response = {
                 "jsonrpc": "2.0",
@@ -949,7 +954,7 @@ async def mcp_endpoint(request: Request):
                     "message": f"Method not found: {method}"
                 }
             }
-            
+
             if wants_streaming:
                 return EventSourceResponse(_stream_response(response))
             else:

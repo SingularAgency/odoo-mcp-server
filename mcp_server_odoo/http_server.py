@@ -971,11 +971,18 @@ async def mcp_endpoint(request: Request):
 
 
 if __name__ == "__main__":
-    config = get_config()
+    # Read server settings directly from env so the process starts even when
+    # Odoo credentials are missing or invalid.  The app will serve /health as
+    # "degraded" until credentials are provided, but it won't crash on boot.
+    _host = os.environ.get("MCP_HOST", "0.0.0.0")
+    _port = int(os.environ.get("MCP_PORT", "8000"))
+    _debug = os.environ.get("MCP_DEBUG", "false").lower() == "true"
+    _log_level = os.environ.get("MCP_LOG_LEVEL", "info").lower()
+
     uvicorn.run(
         "mcp_server_odoo.http_server:app",
-        host=config.server.host,
-        port=config.server.port,
-        reload=config.server.debug,
-        log_level=config.server.log_level.lower()
+        host=_host,
+        port=_port,
+        reload=_debug,
+        log_level=_log_level,
     )

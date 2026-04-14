@@ -35,8 +35,6 @@ services:
       - CACHE_ENABLED=true
       - CACHE_TTL=300
       - CACHE_MAX_SIZE=1000
-    volumes:
-      - logs:/app/logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -44,6 +42,3 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-
-volumes:
-  logs:

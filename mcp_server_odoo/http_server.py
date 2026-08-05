@@ -1,11 +1,12 @@
 """FastAPI-based HTTP streaming MCP server for Odoo integration."""
 
 import asyncio
+import hmac
 import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -15,12 +16,20 @@ from sse_starlette.sse import EventSourceResponse
 import uvicorn
 from mcp.types import Tool, TextContent
 
+from . import oauth
 from .config import get_config
 from .logger import get_logger
 from .services.odoo_service import get_odoo_service
 from .services.cache_service import get_cache_service
 
 logger = get_logger(__name__)
+
+# Protocol versions this server can speak, newest last.
+SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
+
+# Everything a statically-keyed client gets.  The API-key path predates scopes,
+# so it keeps full access and Claude Desktop is unaffected by this change.
+ALL_SCOPES: Set[str] = set(oauth.SUPPORTED_SCOPES)
 
 # Session storage (in production, use Redis or similar)
 sessions: Dict[str, Dict[str, Any]] = {}
@@ -55,8 +64,12 @@ def _fix_tool_schema(tool_dict: Dict[str, Any]) -> Dict[str, Any]:
     return tool_dict
 
 
-async def get_all_tools() -> List[Dict[str, Any]]:
-    """Get all available tools."""
+async def get_all_tools(granted_scopes: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+    """Get all available tools, optionally filtered to what the caller may call.
+
+    Filtering here means a read-only client never sees delete_record at all,
+    rather than discovering it and failing on use.
+    """
     tools = []
     
     # Record management tools
@@ -333,9 +346,12 @@ async def get_all_tools() -> List[Dict[str, Any]]:
     # Combine all tools and fix schemas
     all_tools = record_tools + search_tools + model_tools + server_tools
     for tool in all_tools:
+        if granted_scopes is not None:
+            if oauth.scope_for_tool(tool.name) not in granted_scopes:
+                continue
         tool_dict = tool.model_dump()
         tools.append(_fix_tool_schema(tool_dict))
-        
+
     return tools
     
 
@@ -662,67 +678,129 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
+# Add CORS middleware.
+#
+# allow_credentials cannot be combined with a "*" origin — browsers reject that
+# pair outright — and the OAuth handshake needs WWW-Authenticate to be readable
+# by the client, so it is explicitly exposed.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["WWW-Authenticate", "Mcp-Session-Id", "MCP-Protocol-Version"],
 )
+
+# Register the OAuth authorization-server endpoints (discovery metadata,
+# dynamic client registration, /authorize, /token).
+app.include_router(oauth.router)
+
+
+def _unauthorized(request: Request, message: str, *, error: str = "invalid_token") -> JSONResponse:
+    """401 in JSON-RPC shape, carrying the challenge that starts OAuth discovery.
+
+    The WWW-Authenticate header is what makes an OAuth-only client (Hyperagent)
+    discover this server's authorization endpoints instead of giving up.
+    """
+    base = oauth.base_url_for(request)
+    return JSONResponse(
+        status_code=401,
+        headers={
+            "WWW-Authenticate": oauth.www_authenticate_header(
+                base, error=error, scope=" ".join(oauth.DEFAULT_SCOPES)
+            )
+        },
+        content={
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32001, "message": f"Unauthorized: {message}"},
+        },
+    )
 
 
 @app.middleware("http")
-async def api_key_auth(request: Request, call_next):
-    """API Key authentication middleware.
+async def authenticate(request: Request, call_next):
+    """Authenticate a request via OAuth bearer token or static API key.
 
-    Skips auth for /health and root GET endpoints.
-    Accepts the API key from any of these sources (checked in order):
-      1. Query parameter  ?key=VALUE          (for Claude custom connectors UI)
-      2. Header           X-API-Key: VALUE    (for Cursor / programmatic use)
-      3. Header           Authorization: Bearer VALUE
+    Two credential paths are supported side by side:
+
+      * OAuth 2.1 bearer token — for clients that only speak OAuth (Hyperagent).
+        Scopes ride along in the token and are enforced per tool.
+      * Static API key via ?key=, X-API-Key or Authorization: Bearer — the
+        original scheme, kept so existing Claude Desktop and Cursor setups keep
+        working unchanged.  It grants every scope.
+
+    Unauthenticated paths are the health check, the root document, and the OAuth
+    endpoints themselves — discovery and the consent screen have to be reachable
+    before a token exists, or the handshake can never start.
     """
-    # Always allow health checks and root GET without auth
-    if request.url.path in ("/health", "/") and request.method == "GET":
+    # Starlette's own trailing-slash redirect happens during routing, which is
+    # downstream of this middleware — so normalize here, or "/authorize/" would
+    # be refused before it ever had a chance to be redirected.
+    path = request.url.path.rstrip("/") or "/"
+
+    # CORS preflight carries no credentials by design.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    if path in ("/health", "/") and request.method == "GET":
+        return await call_next(request)
+
+    if path in oauth.PUBLIC_PATHS:
         return await call_next(request)
 
     mcp_api_key = os.environ.get("MCP_API_KEY", "").strip()
+    oauth_config = oauth.get_oauth_config()
 
-    # If no API key configured, allow all traffic (dev/open mode)
-    if not mcp_api_key:
+    bearer = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        bearer = auth_header[len("Bearer "):].strip()
+
+    if bearer:
+        claims = oauth.validate_access_token(bearer, request)
+        if claims:
+            request.state.scopes = oauth.expand_scopes(claims.get("scope", "").split())
+            request.state.auth_method = "oauth"
+            request.state.client_id = claims.get("client_id", "")
+            return await call_next(request)
+
+        # Not one of our tokens — it may still be the static key, which Cursor
+        # and other programmatic clients send in the same header.
+        if mcp_api_key and hmac.compare_digest(bearer, mcp_api_key):
+            request.state.scopes = ALL_SCOPES
+            request.state.auth_method = "api_key"
+            return await call_next(request)
+
+        return _unauthorized(request, "the bearer token is invalid or expired")
+
+    # Static key via query parameter or dedicated header.
+    static_key = request.query_params.get("key", "") or request.headers.get("X-API-Key", "")
+    if static_key:
+        if mcp_api_key and hmac.compare_digest(static_key, mcp_api_key):
+            request.state.scopes = ALL_SCOPES
+            request.state.auth_method = "api_key"
+            return await call_next(request)
+        return _unauthorized(request, "invalid API key")
+
+    # No credential at all.  With nothing configured the server stays open for
+    # local development, exactly as it did before OAuth existed.
+    if not mcp_api_key and not oauth_config.configured:
+        request.state.scopes = ALL_SCOPES
+        request.state.auth_method = "open"
         return await call_next(request)
 
-    # 1. Query parameter ?key=VALUE  (used by Claude connector UI — no custom headers)
-    token = request.query_params.get("key", "")
+    return _unauthorized(
+        request,
+        "authentication required. Use the OAuth flow, or provide the API key via "
+        "?key=VALUE, X-API-Key, or Authorization: Bearer <key>.",
+    )
 
-    # 2. X-API-Key header
-    if not token:
-        token = request.headers.get("X-API-Key", "")
 
-    # 3. Authorization: Bearer <token>
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[len("Bearer "):]
-
-    if token != mcp_api_key:
-        return JSONResponse(
-            status_code=401,
-            content={
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {
-                    "code": -32001,
-                    "message": (
-                        "Unauthorized: missing or invalid API key. "
-                        "Provide it via: ?key=VALUE (URL param), "
-                        "X-API-Key header, or Authorization: Bearer <key>."
-                    )
-                }
-            }
-        )
-
-    return await call_next(request)
+def granted_scopes(request: Request) -> Set[str]:
+    """Scopes attached to the current request by the auth middleware."""
+    return getattr(request.state, "scopes", ALL_SCOPES)
 
 
 def _stream_response(data: Dict[str, Any]):
@@ -754,6 +832,37 @@ async def health_check():
         return {"status": "degraded", "odoo_connected": False, "error": str(e)}
 
 
+@app.get("/mcp")
+async def mcp_get_stream(request: Request):
+    """Streamable HTTP: the optional server-initiated SSE stream.
+
+    This server never pushes unsolicited messages, so the spec's prescribed
+    answer is 405.  Replying explicitly (instead of 404) keeps clients that
+    probe for the stream from treating the endpoint as missing.
+    """
+    return JSONResponse(
+        status_code=405,
+        headers={"Allow": "POST, DELETE"},
+        content={
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32000,
+                "message": "This server does not offer a server-initiated SSE stream.",
+            },
+        },
+    )
+
+
+@app.delete("/mcp")
+async def mcp_delete_session(request: Request):
+    """Streamable HTTP: explicit session teardown."""
+    session_id = request.headers.get("Mcp-Session-Id")
+    if session_id:
+        sessions.pop(session_id, None)
+    return Response(status_code=204)
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     """Main MCP endpoint for handling JSON-RPC requests."""
@@ -782,11 +891,21 @@ async def mcp_endpoint(request: Request):
         
         # Handle different MCP methods
         if method == "initialize":
+            # Echo the client's protocol version when we support it, otherwise
+            # answer with our newest.  Pinning 2024-11-05 unconditionally (as
+            # this did before) predates the authorization spec and can make an
+            # OAuth-capable client fall back to unauthenticated behaviour.
+            requested_version = params.get("protocolVersion")
+            negotiated_version = (
+                requested_version
+                if requested_version in SUPPORTED_PROTOCOL_VERSIONS
+                else SUPPORTED_PROTOCOL_VERSIONS[-1]
+            )
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": negotiated_version,
                     "capabilities": {
                         "tools": {},
                         "resources": {},
@@ -814,22 +933,49 @@ async def mcp_endpoint(request: Request):
                 )
         
         elif method == "tools/list":
-            tools = await get_all_tools()
+            scopes = granted_scopes(request)
+            tools = await get_all_tools(scopes)
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {"tools": tools}
             }
-            
+
             if wants_streaming:
                 return EventSourceResponse(_stream_response(response))
             else:
                 return JSONResponse(content=response)
-        
+
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
-            
+
+            # Scope check.  tools/list already hides what the caller cannot use,
+            # so reaching this branch means the client asked for a tool it was
+            # never offered.
+            required_scope = oauth.scope_for_tool(tool_name)
+            if required_scope not in granted_scopes(request):
+                logger.warning(
+                    f"Denied {tool_name}: requires {required_scope}, granted "
+                    f"{' '.join(sorted(granted_scopes(request))) or 'none'}"
+                )
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32003,
+                        "message": (
+                            f"Forbidden: '{tool_name}' requires the "
+                            f"'{required_scope}' scope, which this connection was "
+                            f"not granted."
+                        ),
+                    },
+                }
+                if wants_streaming:
+                    return EventSourceResponse(_stream_response(response))
+                else:
+                    return JSONResponse(content=response)
+
             try:
                 result = await call_tool(tool_name, arguments)
                 

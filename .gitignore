@@ -189,3 +189,11 @@ coverage.xml
 *.cover
 .pytest_cache/
 .hypothesis/
+
+# The project's own test suite. The generic "tests/" and "test_*.py" ignores
+# above come from a boilerplate template and would exclude it; CLAUDE.md
+# documents pytest as part of the workflow, so keep it tracked.
+!tests/
+!tests/**
+tests/**/__pycache__/
+tests/**/*.pyc

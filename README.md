@@ -101,6 +101,52 @@ python -m mcp_server_odoo.http_server
 python -m mcp_server_odoo
 ```
 
+## 🔐 Authentication
+
+The HTTP server supports two credential paths at the same time, so you can serve
+every kind of client from one deployment.
+
+### API key (Claude Desktop, Cursor, scripts)
+
+Set `MCP_API_KEY` and pass it in any of these ways:
+
+| Method | Example |
+|---|---|
+| Query parameter | `https://your-domain.com/mcp?key=YOUR_KEY` |
+| Header | `X-API-Key: YOUR_KEY` |
+| Header | `Authorization: Bearer YOUR_KEY` |
+
+This path grants access to every tool.
+
+### OAuth (Hyperagent and other OAuth-only clients)
+
+Some clients will only connect through the OAuth flow in the MCP Authorization
+spec — they never send an API key. For those, the server acts as its own OAuth
+2.1 authorization server: no external identity provider, and your Odoo
+credentials are not involved. A human approves the connection once on a consent
+screen, and the client then holds a token.
+
+Minimum configuration:
+
+```bash
+MCP_PUBLIC_URL=https://your-mcp-domain.com
+MCP_OAUTH_PASSWORD=a-strong-secret-for-the-consent-screen
+MCP_OAUTH_SECRET=a-strong-secret-for-signing-tokens
+MCP_OAUTH_ALLOWED_REDIRECTS=https://claude.ai/api/mcp/auth_callback,https://hyperagent.com/*
+```
+
+`MCP_OAUTH_ALLOWED_REDIRECTS` is the control that protects the flow — without it
+an attacker could register a client pointing at their own callback and phish an
+operator into approving it. HTTPS is mandatory.
+
+OAuth connections carry scopes (`odoo:read`, `odoo:write`, `odoo:admin`), and
+tools outside the granted scopes are hidden from `tools/list`. Deletion and
+arbitrary method execution require `odoo:admin`, which is not granted by default.
+
+**See [docs/OAUTH.md](docs/OAUTH.md)** for the full reference: every environment
+variable, the threat model, how to discover a new client's callback URL, token
+revocation, and deployment verification commands.
+
 ## 🌐 Remote Access with ngrok (AI Agent Integration)
 
 This implementation allows you to expose your local MCP server to AI agents like Flowhunt, enabling remote automation of your Odoo business processes.

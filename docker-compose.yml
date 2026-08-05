@@ -31,16 +31,13 @@ services:
       - MCP_LOG_LEVEL=INFO
       # ── Auth (required for centralized/public deployment) ────────────────
       - MCP_API_KEY=${MCP_API_KEY}
-      # ── OAuth (required for OAuth-only clients such as Hyperagent) ───────
-      - MCP_OAUTH_ENABLED=${MCP_OAUTH_ENABLED:-true}
+      # ── OAuth (for OAuth-only clients such as Hyperagent) ────────────────
+      # Activates automatically once MCP_API_KEY is set. Only these two are
+      # normally needed; MCP_OAUTH_PASSWORD is optional and falls back to
+      # MCP_API_KEY. See docs/OAUTH.md.
       - MCP_PUBLIC_URL=${MCP_PUBLIC_URL}
-      - MCP_OAUTH_PASSWORD=${MCP_OAUTH_PASSWORD}
-      - MCP_OAUTH_SECRET=${MCP_OAUTH_SECRET}
       - MCP_OAUTH_ALLOWED_REDIRECTS=${MCP_OAUTH_ALLOWED_REDIRECTS}
-      - MCP_OAUTH_ALLOW_LOCALHOST=${MCP_OAUTH_ALLOW_LOCALHOST:-false}
-      - MCP_OAUTH_ACCESS_TTL=${MCP_OAUTH_ACCESS_TTL:-2592000}
-      - MCP_OAUTH_REFRESH_TTL=${MCP_OAUTH_REFRESH_TTL:-31536000}
-      - MCP_TRUST_PROXY_HEADERS=${MCP_TRUST_PROXY_HEADERS:-true}
+      - MCP_OAUTH_PASSWORD=${MCP_OAUTH_PASSWORD}
       # ── Cache ────────────────────────────────────────────────────────────
       - CACHE_ENABLED=true
       - CACHE_TTL=300

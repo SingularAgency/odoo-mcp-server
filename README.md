@@ -126,18 +126,20 @@ spec — they never send an API key. For those, the server acts as its own OAuth
 credentials are not involved. A human approves the connection once on a consent
 screen, and the client then holds a token.
 
-Minimum configuration:
+It activates automatically once `MCP_API_KEY` is set. Two more variables and
+you are done:
 
 ```bash
 MCP_PUBLIC_URL=https://your-mcp-domain.com
-MCP_OAUTH_PASSWORD=a-strong-secret-for-the-consent-screen
-MCP_OAUTH_SECRET=a-strong-secret-for-signing-tokens
 MCP_OAUTH_ALLOWED_REDIRECTS=https://claude.ai/api/mcp/auth_callback,https://hyperagent.com/*
 ```
 
 `MCP_OAUTH_ALLOWED_REDIRECTS` is the control that protects the flow — without it
 an attacker could register a client pointing at their own callback and phish an
 operator into approving it. HTTPS is mandatory.
+
+Everything else is a fixed default. Optionally set `MCP_OAUTH_PASSWORD` so the
+consent screen uses a secret distinct from your long-lived `MCP_API_KEY`.
 
 OAuth connections carry scopes (`odoo:read`, `odoo:write`, `odoo:admin`), and
 tools outside the granted scopes are hidden from `tools/list`. Deletion and

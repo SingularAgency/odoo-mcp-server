@@ -29,22 +29,32 @@ setups keep working unchanged.
 
 ## Configuration
 
+OAuth activates automatically once `MCP_API_KEY` is set. There are three
+variables in total, and only two are normally worth setting:
+
 | Variable | Required | Purpose |
 |---|---|---|
-| `MCP_OAUTH_ENABLED` | no (`true`) | Master switch. `false` leaves only API-key auth. |
-| `MCP_PUBLIC_URL` | **yes in production** | Public HTTPS base URL, no trailing slash. OAuth requires the issuer to match exactly, and behind a reverse proxy the request URL is the internal one. |
-| `MCP_OAUTH_PASSWORD` | yes | The secret a human types once into the consent screen. Falls back to `MCP_API_KEY`. |
-| `MCP_OAUTH_SECRET` | recommended | Signs the tokens. Falls back to a value derived from `MCP_OAUTH_PASSWORD`. |
-| `MCP_OAUTH_ALLOWED_REDIRECTS` | **yes** | Comma-separated redirect-URI allowlist. See below — this is the control that protects the flow. |
-| `MCP_OAUTH_ALLOW_LOCALHOST` | no (`false`) | Permit `http://localhost` / `127.0.0.1` callbacks on any port, for the MCP Inspector. Keep `false` in production. |
-| `MCP_OAUTH_ACCESS_TTL` | no (30 days) | Access token lifetime in seconds. |
-| `MCP_OAUTH_REFRESH_TTL` | no (1 year) | Refresh token lifetime in seconds. |
-| `MCP_TRUST_PROXY_HEADERS` | no (`true`) | Honour `X-Forwarded-Proto/Host/For`. Correct behind Hostinger, Traefik or nginx. |
+| `MCP_PUBLIC_URL` | **yes in production** | Public HTTPS base URL, no trailing slash. OAuth requires the issuer to match exactly, and behind a reverse proxy the request URL is the internal one. Falls back to the proxy's `X-Forwarded-*` headers. |
+| `MCP_OAUTH_ALLOWED_REDIRECTS` | **yes** | Comma-separated redirect-URI allowlist. See below — this is the control that protects the flow. Defaults to the Claude callbacks. |
+| `MCP_OAUTH_PASSWORD` | no | The secret typed into the consent screen. Falls back to `MCP_API_KEY`; set it separately so the long-lived programmatic key never has to be pasted into a browser form. |
 
-Generate the two secrets with:
+Everything else is fixed: access tokens last 30 days, refresh tokens 1 year,
+authorization codes 60 seconds, PKCE is S256-only, and the proxy's forwarded
+headers are always honoured. These are the only sane settings for a
+single-tenant server, and each extra knob is one more thing to get wrong in a
+deployment dashboard.
+
+Generate a secret with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+For local testing with the MCP Inspector, add its callback to the allowlist —
+a wildcard without a port matches whatever port it picks:
+
+```bash
+MCP_OAUTH_ALLOWED_REDIRECTS=http://localhost/*
 ```
 
 ## The redirect allowlist is the real security control
@@ -107,17 +117,15 @@ The static API key path grants every scope, preserving pre-OAuth behaviour.
 ## Token revocation
 
 Tokens are stateless JWTs, which is what lets them survive container restarts
-without a database. The trade-off: **there is no per-token revocation.** To
-invalidate a leaked token before it expires, rotate `MCP_OAUTH_SECRET` — this
-invalidates every issued token at once and all clients must re-authorize.
+without a database. The trade-off: **there is no per-token revocation.**
 
-If you need to revoke individual tokens, that is the point at which to add a
-small persistent store; do not pay for it before you need it.
+The signing key is derived from the consent password, so **rotating
+`MCP_OAUTH_PASSWORD` (or `MCP_API_KEY`, if you did not set a separate password)
+invalidates every issued token at once.** That is the revocation lever. All
+clients then have to re-authorize.
 
-Lowering `MCP_OAUTH_ACCESS_TTL` shrinks the exposure window from a leak. It is
-safe to lower when the client refreshes reliably (the metadata advertises the
-`refresh_token` grant); a client that does not refresh will prompt for
-re-authorization at the end of each window.
+If you ever need to revoke individual tokens, that is the point at which to add
+a small persistent store; do not pay for it before you need it.
 
 ## Verifying a deployment
 
@@ -142,7 +150,7 @@ set `MCP_PUBLIC_URL`.
 
 For an interactive walkthrough of the whole flow, point the
 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at the server
-with `MCP_OAUTH_ALLOW_LOCALHOST=true`.
+with `http://localhost/*` in the allowlist.
 
 ## Requirements
 

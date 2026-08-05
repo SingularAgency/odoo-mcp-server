@@ -17,9 +17,9 @@ from .conftest import (
     CONSENT_PASSWORD,
     INITIALIZE,
     PUBLIC_URL,
-    SIGNING_SECRET,
     STATIC_API_KEY,
     pkce_pair,
+    signing_key_for,
     tools_list,
 )
 
@@ -96,13 +96,13 @@ class TestDiscovery:
         ).json()
         assert body["issuer"] == "https://public.example.com"
 
-    def test_forwarded_headers_ignored_when_untrusted(self, client, oauth_env):
-        oauth_env(MCP_PUBLIC_URL=None, MCP_TRUST_PROXY_HEADERS="false")
+    def test_public_url_overrides_forwarded_headers(self, client):
+        """MCP_PUBLIC_URL is authoritative, so a forged header cannot move it."""
         body = client.get(
             "/.well-known/oauth-authorization-server",
             headers={"X-Forwarded-Host": "attacker.example.com"},
         ).json()
-        assert "attacker" not in body["issuer"]
+        assert body["issuer"] == PUBLIC_URL
 
 
 # ── Dynamic client registration ──────────────────────────────────────────────
@@ -189,13 +189,15 @@ class TestRedirectAllowlist:
         config = oauth_env(MCP_OAUTH_ALLOWED_REDIRECTS="https://hyperagent.com/*")
         assert oauth._redirect_allowed(candidate, config.allowed_redirects) is expected
 
-    def test_localhost_is_opt_in(self, oauth_env):
+    def test_localhost_requires_an_explicit_allowlist_entry(self, oauth_env):
+        """Local dev is opt-in through the allowlist, not a separate flag."""
         config = oauth_env(MCP_OAUTH_ALLOWED_REDIRECTS=None)
         assert not oauth._redirect_allowed("http://localhost:6274/cb", config.allowed_redirects)
 
-        config = oauth_env(MCP_OAUTH_ALLOWED_REDIRECTS=None, MCP_OAUTH_ALLOW_LOCALHOST="true")
+        config = oauth_env(MCP_OAUTH_ALLOWED_REDIRECTS="http://localhost/*")
+        # A wildcard without a port matches whatever port the Inspector picks.
         assert oauth._redirect_allowed("http://localhost:6274/cb", config.allowed_redirects)
-        assert oauth._redirect_allowed("http://127.0.0.1:9999/cb", config.allowed_redirects)
+        assert oauth._redirect_allowed("http://localhost:9999/cb", config.allowed_redirects)
         assert not oauth._redirect_allowed(
             "https://localhost.evil.com/cb", config.allowed_redirects
         )
@@ -431,24 +433,32 @@ class TestTokenValidation:
 
     def test_token_for_another_audience_is_rejected(self, client):
         """RFC 8707 audience binding: a token minted for another server fails."""
-        import hashlib
-
-        key = hashlib.sha256(f"mcp-oauth-v1:{SIGNING_SECRET}".encode()).hexdigest()
-        forged = self._forge(key, aud="https://other-server.com/mcp")
+        forged = self._forge(
+            signing_key_for(CONSENT_PASSWORD), aud="https://other-server.com/mcp"
+        )
         response = client.post(
             "/mcp", json=INITIALIZE, headers={"Authorization": f"Bearer {forged}"}
         )
         assert response.status_code == 401
 
     def test_expired_token_is_rejected(self, client):
-        import hashlib
-
-        key = hashlib.sha256(f"mcp-oauth-v1:{SIGNING_SECRET}".encode()).hexdigest()
-        forged = self._forge(key, exp=1)
+        forged = self._forge(signing_key_for(CONSENT_PASSWORD), exp=1)
         response = client.post(
             "/mcp", json=INITIALIZE, headers={"Authorization": f"Bearer {forged}"}
         )
         assert response.status_code == 401
+
+    def test_rotating_the_password_invalidates_issued_tokens(self, client, access_token, oauth_env):
+        """The revocation story: the signing key is derived from the password."""
+        token, _ = access_token
+        assert client.post(
+            "/mcp", json=INITIALIZE, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 200
+
+        oauth_env(MCP_OAUTH_PASSWORD="a-rotated-consent-secret")
+        assert client.post(
+            "/mcp", json=INITIALIZE, headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 401
 
     def test_refresh_token_is_not_accepted_as_an_access_token(self, client, access_token):
         _, payload = access_token
@@ -460,8 +470,8 @@ class TestTokenValidation:
         assert response.status_code == 401
 
     def test_signing_key_is_always_full_length(self, oauth_env):
-        """A short MCP_OAUTH_SECRET must not yield a weak HMAC key."""
-        config = oauth_env(MCP_OAUTH_SECRET="tiny")
+        """A short password must not yield a weak HMAC key."""
+        config = oauth_env(MCP_OAUTH_PASSWORD="tiny")
         assert len(config.signing_key) == 64
 
 
@@ -497,12 +507,15 @@ class TestStaticApiKey:
 
     def test_open_mode_when_nothing_is_configured(self, client, oauth_env):
         """Local development with no secrets set keeps the old open behaviour."""
-        oauth_env(MCP_API_KEY=None, MCP_OAUTH_PASSWORD=None, MCP_OAUTH_SECRET=None)
+        oauth_env(MCP_API_KEY=None, MCP_OAUTH_PASSWORD=None)
+        assert not oauth.get_oauth_config().configured
         assert client.post("/mcp", json=INITIALIZE).status_code == 200
 
-    def test_oauth_can_be_disabled_without_breaking_the_api_key(self, client, oauth_env):
-        oauth_env(MCP_OAUTH_ENABLED="false")
-        assert not oauth.get_oauth_config().configured
+    def test_oauth_password_falls_back_to_the_api_key(self, client, oauth_env):
+        """With only MCP_API_KEY set, OAuth still works — no extra variable needed."""
+        config = oauth_env(MCP_OAUTH_PASSWORD=None)
+        assert config.configured
+        assert config.password == STATIC_API_KEY
         assert client.post("/mcp", params={"key": STATIC_API_KEY}, json=tools_list()).status_code == 200
         assert client.post("/mcp", json=INITIALIZE).status_code == 401
 

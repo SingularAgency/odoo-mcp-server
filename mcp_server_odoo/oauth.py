@@ -29,10 +29,10 @@ attacker generated the challenge.  Since the allowlist bounds the host a code
 can ever be delivered to, we do not additionally need to prove the caller
 "owns" the ``client_id``.
 
-Tokens are stateless HS256 JWTs signed with ``MCP_OAUTH_SECRET``, so they
-survive container restarts without a database.  The trade-off is that there is
-no per-token revocation: to invalidate a leaked token before it expires, rotate
-``MCP_OAUTH_SECRET`` (which invalidates every token at once).
+Tokens are stateless HS256 JWTs signed with a key derived from that secret, so
+they survive container restarts without a database.  The trade-off is that
+there is no per-token revocation: to invalidate a leaked token before it
+expires, rotate the secret, which invalidates every token at once.
 """
 
 import hashlib
@@ -125,94 +125,64 @@ _DEFAULT_ALLOWED_REDIRECTS = [
     "https://claude.com/api/mcp/auth_callback",
 ]
 
-_LOCALHOST_REDIRECTS = [
-    "http://localhost/*",
-    "http://127.0.0.1/*",
-]
-
-_ACCESS_TTL_DEFAULT = 30 * 24 * 3600      # 30 days
-_REFRESH_TTL_DEFAULT = 365 * 24 * 3600    # 1 year
-_CODE_TTL = 60                            # authorization codes are short-lived
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning(f"{name}={raw!r} is not an integer; using default {default}")
-        return default
+# Token lifetimes.  Fixed rather than configurable: there is exactly one sane
+# setting for a single-tenant server, and every extra knob is one more thing to
+# get wrong in a deployment dashboard.  Shortening the access TTL is the only
+# reason to touch these, and rotating the secret revokes everything anyway.
+ACCESS_TTL = 30 * 24 * 3600      # 30 days
+REFRESH_TTL = 365 * 24 * 3600    # 1 year
+_CODE_TTL = 60                   # authorization codes are short-lived
 
 
 class OAuthConfig:
-    """OAuth settings resolved from the environment."""
+    """OAuth settings resolved from the environment.
+
+    Deliberately small.  Only two variables normally need setting:
+
+      MCP_PUBLIC_URL               the server's public HTTPS base URL
+      MCP_OAUTH_ALLOWED_REDIRECTS  the redirect-URI allowlist
+
+    ``MCP_OAUTH_PASSWORD`` is optional and falls back to ``MCP_API_KEY``; it
+    exists so the long-lived programmatic key never has to be pasted into a
+    browser form (history, password managers, shared machines).
+    """
 
     def __init__(self) -> None:
-        self.enabled = _env_flag("MCP_OAUTH_ENABLED", True)
-
-        # The secret a human types into the consent screen.  Kept separate from
-        # MCP_API_KEY so the long-lived programmatic key never has to be pasted
-        # into a browser form (history, password managers, shared machines).
         self.password = (
             os.environ.get("MCP_OAUTH_PASSWORD", "").strip()
             or os.environ.get("MCP_API_KEY", "").strip()
         )
 
-        # Token signing key.  Without an explicit value we fall back to the
-        # password so tokens still survive restarts; a standalone secret is
-        # better because rotating it does not force clients to re-enter the
-        # password.
+        # Tokens are signed with a key derived from the password, so they
+        # survive restarts without any stored state, and rotating the password
+        # invalidates every issued token — which is the revocation story.
         #
-        # Whatever we are given is stretched through SHA-256 so the HMAC key is
-        # always a full 32 bytes: RFC 7518 §3.2 requires at least the hash
-        # length for HS256, and an operator who sets a short MCP_OAUTH_SECRET
-        # should not silently end up with weak signatures.
-        seed = os.environ.get("MCP_OAUTH_SECRET", "").strip() or self.password
+        # SHA-256 also guarantees a full 32-byte HMAC key regardless of how
+        # short the configured secret is (RFC 7518 §3.2 requires at least the
+        # hash length for HS256).
         self.signing_key = (
-            hashlib.sha256(f"mcp-oauth-v1:{seed}".encode()).hexdigest() if seed else ""
+            hashlib.sha256(f"mcp-oauth-v1:{self.password}".encode()).hexdigest()
+            if self.password
+            else ""
         )
 
-        self.public_url = self._resolve_public_url()
-        self.allowed_redirects = self._resolve_allowed_redirects()
-        self.access_ttl = _env_int("MCP_OAUTH_ACCESS_TTL", _ACCESS_TTL_DEFAULT)
-        self.refresh_ttl = _env_int("MCP_OAUTH_REFRESH_TTL", _REFRESH_TTL_DEFAULT)
-        self.trust_proxy_headers = _env_flag("MCP_TRUST_PROXY_HEADERS", True)
+        # OAuth requires the issuer and endpoint URLs to match exactly, and
+        # behind a reverse proxy the request URL is the internal one.  Setting
+        # this explicitly is preferred; otherwise we fall back to the
+        # X-Forwarded-* headers the proxy sets, per request.
+        self.public_url = os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
 
-    @staticmethod
-    def _resolve_public_url() -> str:
-        """The externally reachable base URL, without trailing slash.
-
-        OAuth requires the issuer and endpoint URLs to match exactly, and behind
-        a reverse proxy the request URL is the internal one.  Setting
-        MCP_PUBLIC_URL explicitly is strongly preferred; otherwise we fall back
-        to forwarded headers per request.
-        """
-        return os.environ.get("MCP_PUBLIC_URL", "").strip().rstrip("/")
-
-    @staticmethod
-    def _resolve_allowed_redirects() -> List[str]:
-        raw = os.environ.get("MCP_OAUTH_ALLOWED_REDIRECTS", "").strip()
-        if raw:
-            entries = [item.strip() for item in raw.split(",") if item.strip()]
-        else:
-            entries = list(_DEFAULT_ALLOWED_REDIRECTS)
-        if _env_flag("MCP_OAUTH_ALLOW_LOCALHOST", False):
-            entries.extend(_LOCALHOST_REDIRECTS)
-        return entries
+        raw_redirects = os.environ.get("MCP_OAUTH_ALLOWED_REDIRECTS", "").strip()
+        self.allowed_redirects = (
+            [item.strip() for item in raw_redirects.split(",") if item.strip()]
+            if raw_redirects
+            else list(_DEFAULT_ALLOWED_REDIRECTS)
+        )
 
     @property
     def configured(self) -> bool:
         """OAuth can only run if there is a secret to check against."""
-        return self.enabled and bool(self.password) and bool(self.signing_key)
+        return bool(self.password)
 
 
 _config: Optional[OAuthConfig] = None
@@ -223,12 +193,9 @@ def get_oauth_config() -> OAuthConfig:
     global _config
     if _config is None:
         _config = OAuthConfig()
-        if not _config.enabled:
-            logger.info("OAuth is disabled (MCP_OAUTH_ENABLED=false)")
-        elif not _config.configured:
-            logger.warning(
-                "OAuth is enabled but no secret is set — set MCP_OAUTH_PASSWORD "
-                "(or MCP_API_KEY). The OAuth endpoints will refuse all requests."
+        if not _config.configured:
+            logger.info(
+                "OAuth is inactive — no MCP_OAUTH_PASSWORD or MCP_API_KEY is set."
             )
         else:
             if not _config.public_url:
@@ -238,8 +205,8 @@ def get_oauth_config() -> OAuthConfig:
                     "(e.g. https://odoo-mcp.example.com) for reliable discovery."
                 )
             logger.info(
-                f"OAuth enabled — {len(_config.allowed_redirects)} allowed redirect "
-                f"pattern(s), access token TTL {_config.access_ttl}s"
+                f"OAuth active — {len(_config.allowed_redirects)} allowed redirect "
+                f"pattern(s)"
             )
     return _config
 
@@ -273,23 +240,20 @@ def canonical_uri(uri: str) -> str:
 
 
 def base_url_for(request: Request) -> str:
-    """Resolve this server's public base URL for the current request."""
+    """Resolve this server's public base URL for the current request.
+
+    ``MCP_PUBLIC_URL`` wins when set.  Otherwise we trust the proxy's
+    X-Forwarded-* headers, since this server is always meant to sit behind TLS
+    termination.  A caller who forges those headers only poisons the metadata
+    in their own response, which gains them nothing.
+    """
     config = get_oauth_config()
     if config.public_url:
         return config.public_url
 
     headers = request.headers
-    scheme = request.url.scheme
-    host = request.url.netloc
-
-    if config.trust_proxy_headers:
-        forwarded_proto = headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
-        forwarded_host = headers.get("X-Forwarded-Host", "").split(",")[0].strip()
-        if forwarded_proto:
-            scheme = forwarded_proto
-        if forwarded_host:
-            host = forwarded_host
-
+    scheme = headers.get("X-Forwarded-Proto", "").split(",")[0].strip() or request.url.scheme
+    host = headers.get("X-Forwarded-Host", "").split(",")[0].strip() or request.url.netloc
     return f"{scheme}://{host}".rstrip("/")
 
 
@@ -310,6 +274,9 @@ def _redirect_allowed(redirect_uri: str, patterns: List[str]) -> bool:
     Two forms are supported:
       * an exact URL             — ``https://host/path/callback``
       * a host wildcard          — ``https://host/*`` (any path on that host)
+
+    A wildcard whose pattern omits the port matches any port, which is how
+    ``http://localhost/*`` covers the MCP Inspector's random dev port.
 
     Host matching is what actually bounds the attack: a code can only ever be
     delivered to a host the operator named.
@@ -403,16 +370,16 @@ _global_failure_limiter = _SlidingWindow(limit=50, window=900)
 def client_ip(request: Request) -> str:
     """Best-effort client IP for rate limiting.
 
-    Behind a trusted reverse proxy the *rightmost* X-Forwarded-For entry is the
-    one the proxy itself appended, so it is the only one a caller cannot spoof.
+    Behind a reverse proxy the *rightmost* X-Forwarded-For entry is the one the
+    proxy itself appended, so it is the only one a caller cannot spoof.  If a
+    caller does manage to forge it and evade their per-IP bucket, the global
+    failure limiter still bounds brute force.
     """
-    config = get_oauth_config()
-    if config.trust_proxy_headers:
-        forwarded = request.headers.get("X-Forwarded-For", "")
-        if forwarded:
-            hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
-            if hops:
-                return hops[-1]
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        if hops:
+            return hops[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -917,14 +884,13 @@ async def token_endpoint(request: Request) -> JSONResponse:
 def _token_response(
     audience: str, issuer: str, scopes: List[str], client_id: str
 ) -> JSONResponse:
-    config = get_oauth_config()
     access_token = _issue(
         "access",
         issuer=issuer,
         audience=audience,
         scopes=scopes,
         client_id=client_id,
-        ttl=config.access_ttl,
+        ttl=ACCESS_TTL,
     )
     refresh_token = _issue(
         "refresh",
@@ -932,13 +898,13 @@ def _token_response(
         audience=audience,
         scopes=scopes,
         client_id=client_id,
-        ttl=config.refresh_ttl,
+        ttl=REFRESH_TTL,
     )
     return JSONResponse(
         {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": config.access_ttl,
+            "expires_in": ACCESS_TTL,
             "refresh_token": refresh_token,
             "scope": " ".join(scopes),
         },

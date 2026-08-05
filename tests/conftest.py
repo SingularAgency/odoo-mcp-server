@@ -18,30 +18,28 @@ os.environ.setdefault("ODOO_API_KEY", "fake-odoo-key")
 PUBLIC_URL = "https://mcp.example.com"
 STATIC_API_KEY = "static-api-key-for-claude"
 CONSENT_PASSWORD = "consent-secret-123"
-SIGNING_SECRET = "signing-secret-abc"
 CALLBACK = "https://hyperagent.com/oauth/callback"
 
+# The complete OAuth surface: four variables, of which only the last two are
+# normally set in a deployment.
 _OAUTH_ENV_KEYS = (
     "MCP_API_KEY",
-    "MCP_OAUTH_ENABLED",
     "MCP_OAUTH_PASSWORD",
-    "MCP_OAUTH_SECRET",
     "MCP_PUBLIC_URL",
     "MCP_OAUTH_ALLOWED_REDIRECTS",
-    "MCP_OAUTH_ALLOW_LOCALHOST",
-    "MCP_OAUTH_ACCESS_TTL",
-    "MCP_OAUTH_REFRESH_TTL",
-    "MCP_TRUST_PROXY_HEADERS",
 )
 
 DEFAULT_OAUTH_ENV = {
     "MCP_API_KEY": STATIC_API_KEY,
-    "MCP_OAUTH_ENABLED": "true",
     "MCP_OAUTH_PASSWORD": CONSENT_PASSWORD,
-    "MCP_OAUTH_SECRET": SIGNING_SECRET,
     "MCP_PUBLIC_URL": PUBLIC_URL,
     "MCP_OAUTH_ALLOWED_REDIRECTS": CALLBACK,
 }
+
+
+def signing_key_for(password: str) -> str:
+    """The HMAC key the server derives from a consent password."""
+    return hashlib.sha256(f"mcp-oauth-v1:{password}".encode()).hexdigest()
 
 INITIALIZE = {
     "jsonrpc": "2.0",

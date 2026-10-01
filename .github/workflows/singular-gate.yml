@@ -1,0 +1,18 @@
+# Conecta este repo al Singular Gate (https://github.com/SingularAgency/singular-ci).
+# Lo creó el bootstrap automático. El gate detecta solo el stack (Node, Flutter) y si hay Supabase.
+name: Singular Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop, staging, uat]
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    uses: SingularAgency/singular-ci/.github/workflows/gate.yml@v1
+    secrets:
+      CODACY_API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}
